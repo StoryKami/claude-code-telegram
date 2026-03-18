@@ -2,9 +2,12 @@
 
 import argparse
 import asyncio
+import json
 import logging
 import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -296,6 +299,24 @@ async def run_application(app: Dict[str, Any]) -> None:
         bot_task = asyncio.create_task(bot.start())
         tasks.append(bot_task)
 
+        # Send restart notification if applicable
+        restart_file = Path(__file__).resolve().parent.parent / "data" / ".restart_chat"
+        if restart_file.exists():
+            try:
+                info = json.loads(restart_file.read_text())
+                restart_file.unlink()
+                if info.get("auto_reverted"):
+                    msg = "⚠️ Crash detected after pull/restart — auto-reverted to last commit."
+                else:
+                    msg = "✅ Bot restarted successfully."
+                await telegram_bot.send_message(
+                    chat_id=info["chat_id"],
+                    text=msg,
+                    message_thread_id=info.get("thread_id"),
+                )
+            except Exception as e:
+                logger.warning("Failed to send restart notification", error=str(e))
+
         # API server (if enabled)
         if features.api_server_enabled:
             from src.api.server import run_api_server
@@ -400,13 +421,105 @@ async def main() -> None:
         sys.exit(1)
 
 
-def run() -> None:
-    """Synchronous entry point for setuptools."""
+_PROJECT_DIR = Path(__file__).resolve().parent.parent
+_CRASH_MARKER = _PROJECT_DIR / "data" / ".crash_marker"
+_RESTART_CHAT_FILE = _PROJECT_DIR / "data" / ".restart_chat"
+_RETRY_DELAY = 5
+
+
+def _auto_revert() -> bool:
+    """Revert to previous commit if a post-pull crash is detected."""
+    if not _CRASH_MARKER.exists():
+        return False
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nShutdown requested by user")
-        sys.exit(0)
+        marker = json.loads(_CRASH_MARKER.read_text())
+    except Exception:
+        _CRASH_MARKER.unlink(missing_ok=True)
+        return False
+
+    if marker.get("reverted"):
+        _CRASH_MARKER.unlink(missing_ok=True)
+        return False
+
+    print("[AUTO-REVERT] Post-pull crash detected. Reverting to previous commit...", flush=True)
+    try:
+        log = subprocess.run(
+            ["git", "log", "--oneline", "-2"],
+            cwd=str(_PROJECT_DIR), capture_output=True, text=True, timeout=10,
+        )
+        print(f"[AUTO-REVERT] Commits:\n{log.stdout.strip()}", flush=True)
+        stash = subprocess.run(
+            ["git", "stash", "push", "-u", "-m", "auto-stash before revert"],
+            cwd=str(_PROJECT_DIR), capture_output=True, text=True, timeout=10,
+        )
+        print(f"[AUTO-REVERT] Stash: {stash.stdout.strip()}", flush=True)
+        subprocess.run(
+            ["git", "reset", "--hard", "HEAD~1"],
+            cwd=str(_PROJECT_DIR), capture_output=True, timeout=10,
+        )
+        subprocess.run(
+            ["git", "clean", "-fd"],
+            cwd=str(_PROJECT_DIR), capture_output=True, timeout=10,
+        )
+    except Exception as e:
+        print(f"[AUTO-REVERT] Failed: {e}", flush=True)
+        _CRASH_MARKER.unlink(missing_ok=True)
+        return False
+
+    marker["reverted"] = True
+    _CRASH_MARKER.write_text(json.dumps(marker))
+
+    chat_info = marker.get("chat")
+    if chat_info:
+        _RESTART_CHAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _RESTART_CHAT_FILE.write_text(json.dumps({
+            "chat_id": chat_info.get("chat_id"),
+            "thread_id": chat_info.get("thread_id"),
+            "auto_reverted": True,
+        }))
+
+    print("[AUTO-REVERT] Done. Restarting with clean state...", flush=True)
+    return True
+
+
+def _set_crash_marker() -> None:
+    """Write crash marker if restart_chat exists (means pull/restart triggered this run)."""
+    if _RESTART_CHAT_FILE.exists():
+        try:
+            chat_data = json.loads(_RESTART_CHAT_FILE.read_text())
+            if not chat_data.get("auto_reverted"):
+                _CRASH_MARKER.parent.mkdir(parents=True, exist_ok=True)
+                _CRASH_MARKER.write_text(json.dumps({"chat": chat_data}))
+        except Exception:
+            pass
+
+
+def run() -> None:
+    """Synchronous entry point with crash recovery loop."""
+    attempt = 0
+
+    while True:
+        attempt += 1
+
+        if attempt > 1:
+            _auto_revert()
+
+        # Clear stale logging handlers from previous loop iteration
+        logging.root.handlers.clear()
+
+        try:
+            asyncio.run(main())
+            _CRASH_MARKER.unlink(missing_ok=True)
+            break
+        except KeyboardInterrupt:
+            _CRASH_MARKER.unlink(missing_ok=True)
+            print("\nShutdown requested by user")
+            break
+        except Exception as e:
+            print(f"[CRASH] Attempt {attempt}: {e}", flush=True)
+            _set_crash_marker()
+            print(f"[RESTART] Restarting in {_RETRY_DELAY}s...", flush=True)
+            time.sleep(_RETRY_DELAY)
 
 
 if __name__ == "__main__":

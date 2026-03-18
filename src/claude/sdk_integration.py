@@ -1,6 +1,7 @@
 """Claude Code Python SDK integration."""
 
 import asyncio
+import contextlib
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +22,7 @@ from claude_agent_sdk import (
     ProcessError,
     ResultMessage,
     ToolPermissionContext,
+    HookMatcher,
     ToolUseBlock,
     UserMessage,
 )
@@ -53,6 +55,7 @@ class ClaudeResponse:
     is_error: bool = False
     error_type: Optional[str] = None
     tools_used: List[Dict[str, Any]] = field(default_factory=list)
+    usage: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -137,6 +140,9 @@ class ClaudeSDKManager:
         """Initialize SDK manager with configuration."""
         self.config = config
         self.security_validator = security_validator
+        self._active_clients: Dict[int, ClaudeSDKClient] = {}
+        self._active_tasks: Dict[int, "asyncio.Task[None]"] = {}
+        self._active_processes: Dict[int, Any] = {}  # anyio Process objects for direct kill
 
         # Set up environment for Claude Code SDK if API key is provided
         # If no API key is provided, the SDK will use existing CLI authentication
@@ -146,13 +152,58 @@ class ClaudeSDKManager:
         else:
             logger.info("No API key provided, using existing Claude CLI authentication")
 
+    async def interrupt(self, user_id: int) -> bool:
+        """Interrupt an active command for the given user.
+
+        Cancels the asyncio task immediately for instant stop, then fires a
+        graceful interrupt signal to the CLI in the background (best-effort).
+
+        Returns True if an active command was found, False otherwise.
+        """
+        client = self._active_clients.get(user_id)
+        task = self._active_tasks.get(user_id)
+
+        if client is None and task is None:
+            logger.warning("interrupt: no active client or task", user_id=user_id)
+            return False
+
+        proc = self._active_processes.get(user_id)
+        logger.warning(
+            "interrupt called",
+            user_id=user_id,
+            has_client=client is not None,
+            has_task=task is not None,
+            has_proc=proc is not None,
+            task_done=task.done() if task else None,
+        )
+
+        # Kill subprocess directly — this unblocks the stdout reader immediately.
+        if proc is not None:
+            try:
+                proc.terminate()
+                logger.warning("interrupt: subprocess terminated", user_id=user_id)
+            except Exception as e:
+                logger.warning("interrupt: terminate failed", user_id=user_id, error=str(e))
+        else:
+            logger.warning("interrupt: proc is None, falling back to task.cancel only", user_id=user_id)
+
+        # Cancel the asyncio task — no awaiting, instant scheduling
+        if task is not None and not task.done():
+            task.cancel()
+            logger.warning("interrupt: task cancelled", user_id=user_id)
+
+        logger.warning("Interrupted active command", user_id=user_id)
+        return True
+
     async def execute_command(
         self,
         prompt: str,
         working_directory: Path,
+        user_id: int = 0,
         session_id: Optional[str] = None,
         continue_session: bool = False,
         stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
+        hooks: Optional[dict] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -175,7 +226,12 @@ class ClaudeSDKManager:
             # Build system prompt, loading CLAUDE.md from working directory if present
             base_prompt = (
                 f"All file operations must stay within {working_directory}. "
-                "Use relative paths."
+                "Use relative paths.\n\n"
+                "When you need the user to choose between options, use the "
+                "present_choices tool instead of listing options in text. "
+                "This shows clickable buttons in Telegram. "
+                "After calling present_choices, END your response immediately. "
+                "The user's selection will come as the next message."
             )
             claude_md_path = Path(working_directory) / "CLAUDE.md"
             if claude_md_path.exists():
@@ -214,6 +270,10 @@ class ClaudeSDKManager:
                 stderr=_stderr_callback,
             )
 
+            # Wire hooks (e.g. PreCompact notification)
+            if hooks:
+                options.hooks = hooks
+
             # Pass MCP server configuration if enabled
             if self.config.enable_mcp and self.config.mcp_config_path:
                 options.mcp_servers = self._load_mcp_config(self.config.mcp_config_path)
@@ -247,8 +307,23 @@ class ClaudeSDKManager:
                 # a plain string. connect(None) uses an empty async
                 # iterable internally, satisfying the requirement.
                 client = ClaudeSDKClient(options)
+                if user_id:
+                    self._active_clients[user_id] = client
                 try:
                     await client.connect()
+                    # Store subprocess reference for direct kill in interrupt().
+                    # Accessing private transport internals is necessary here —
+                    # the SDK provides no public API to kill the subprocess.
+                    if user_id:
+                        try:
+                            proc = client._transport._process
+                            if proc is not None:
+                                self._active_processes[user_id] = proc
+                                logger.warning("stored subprocess ref", user_id=user_id, proc_pid=getattr(proc, "pid", None))
+                            else:
+                                logger.warning("subprocess ref is None after connect", user_id=user_id)
+                        except AttributeError as e:
+                            logger.warning("failed to get subprocess ref", user_id=user_id, error=str(e))
                     await client.query(prompt)
 
                     # Iterate over raw messages and parse them ourselves
@@ -287,23 +362,45 @@ class ClaudeSDKManager:
                                 )
                 finally:
                     await client.disconnect()
+                    self._active_clients.pop(user_id, None)
+                    self._active_processes.pop(user_id, None)
 
-            # Execute with timeout
-            await asyncio.wait_for(
-                _run_client(),
-                timeout=self.config.claude_timeout_seconds,
-            )
+            # Execute with timeout — store the task so interrupt() can cancel it
+            task: asyncio.Task[None] = asyncio.create_task(_run_client())
+            if user_id:
+                self._active_tasks[user_id] = task
+            try:
+                done, _ = await asyncio.wait(
+                    [task], timeout=self.config.claude_timeout_seconds
+                )
+                if not done:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+                    raise asyncio.TimeoutError()
+                # Re-raise any exception the task stored
+                task.result()
+            except asyncio.CancelledError:
+                # Cancelled by interrupt() — cancel the underlying task too
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+                raise
+            finally:
+                self._active_tasks.pop(user_id, None)
 
             # Extract cost, tools, and session_id from result message
             cost = 0.0
             tools_used: List[Dict[str, Any]] = []
             claude_session_id = None
             result_content = None
+            usage_data: Dict[str, Any] = {}
             for message in messages:
                 if isinstance(message, ResultMessage):
                     cost = getattr(message, "total_cost_usd", 0.0) or 0.0
                     claude_session_id = getattr(message, "session_id", None)
                     result_content = getattr(message, "result", None)
+                    usage_data = dict(getattr(message, "usage", {}) or {})
                     current_time = asyncio.get_event_loop().time()
                     for msg in messages:
                         if isinstance(msg, AssistantMessage):
@@ -377,6 +474,7 @@ class ClaudeSDKManager:
                     ]
                 ),
                 tools_used=tools_used,
+                usage=usage_data,
             )
 
         except asyncio.TimeoutError:

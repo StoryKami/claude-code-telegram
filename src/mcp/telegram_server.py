@@ -43,5 +43,37 @@ async def send_image_to_user(file_path: str, caption: str = "") -> str:
     return f"Image queued for delivery: {path.name}"
 
 
+@mcp.tool()
+async def present_choices(
+    question: str,
+    choices: list[str],
+    allow_custom: bool = False,
+) -> str:
+    """Present choices to the Telegram user as inline buttons.
+
+    Use this tool when you want the user to pick one option from a list.
+    The user will see clickable buttons in Telegram instead of having to type.
+
+    Args:
+        question: The question to display above the buttons.
+        choices: List of choice strings (2-8 items). Keep each under 60 chars.
+        allow_custom: If True, adds a "Type..." button so the user can type a
+                      free-form response instead of picking a preset choice.
+
+    Returns:
+        Confirmation that choices were presented, or error message.
+    """
+    if not choices or len(choices) < 2:
+        return "Error: provide at least 2 choices."
+    if len(choices) > 8:
+        return "Error: maximum 8 choices allowed."
+    return (
+        f"Choices presented to user as clickable buttons: {', '.join(choices)}. "
+        "IMPORTANT: The user will see inline buttons and tap one. "
+        "Their selection will arrive as a follow-up message. "
+        "Do NOT ask them what they chose — just end your response here and wait."
+    )
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")

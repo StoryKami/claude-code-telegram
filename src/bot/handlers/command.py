@@ -1,7 +1,10 @@
 """Command handlers for bot operations."""
 
+import asyncio
+import json
 import os
 import signal
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -1232,16 +1235,38 @@ async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.error("Error in git_command", error=str(e), user_id=user_id)
 
 
+_PROJECT_DIR = str(Path(__file__).resolve().parent.parent.parent.parent)
+
+
+def _save_restart_chat(update: Update) -> None:
+    """Save chat info so restart notification goes to the right place."""
+    restart_file = Path(_PROJECT_DIR) / "data" / ".restart_chat"
+    restart_file.parent.mkdir(parents=True, exist_ok=True)
+    restart_file.write_text(
+        json.dumps(
+            {
+                "chat_id": update.effective_chat.id,
+                "thread_id": getattr(update.effective_message, "message_thread_id", None),
+            }
+        )
+    )
+
+
+async def _git(args: list[str], cwd: str | None = None) -> str:
+    """Run a git command and return stdout."""
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        *args,
+        cwd=cwd or _PROJECT_DIR,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await asyncio.wait_for(proc.communicate(), timeout=15)
+    return (out or err or b"").decode("utf-8", errors="replace").strip()
+
+
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /restart command - gracefully restart the bot process.
-
-    Sends a confirmation message then triggers SIGTERM so systemd
-    (or any process manager with restart-on-exit) brings the bot back up.
-
-    Auth: protected by the auth middleware (group -2) which raises
-    ``ApplicationHandlerStop`` for unauthenticated users before any
-    handler in group 10 runs.  No per-handler check is needed.
-    """
+    """Handle /restart — re-exec the bot process."""
     audit_logger: AuditLogger = context.bot_data.get("audit_logger")
     user_id = update.effective_user.id
 
@@ -1253,11 +1278,132 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if audit_logger:
         await audit_logger.log_command(user_id, "restart", [], True)
 
+    _save_restart_chat(update)
     logger.info("Restart requested via /restart command", user_id=user_id)
+    await asyncio.sleep(0.5)
+    os.execv(sys.executable, [sys.executable, "-m", "src.main"])
 
-    # SIGTERM triggers the existing graceful-shutdown handler in main.py;
-    # systemd Restart=always will bring the process back up.
-    os.kill(os.getpid(), signal.SIGTERM)
+
+async def pull_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /pull — git pull then restart."""
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    user_id = update.effective_user.id
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "pull",
+            cwd=_PROJECT_DIR,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        output = (stdout or stderr or b"").decode("utf-8", errors="replace").strip() or "(no output)"
+        await update.message.reply_text(
+            f"<pre>{escape_html(output)}</pre>\n\nRestarting…",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Git pull failed: {escape_html(str(e))}", parse_mode="HTML")
+        return
+
+    if audit_logger:
+        await audit_logger.log_command(user_id, "pull", [], True)
+
+    _save_restart_chat(update)
+    logger.info("Pull + restart requested", user_id=user_id)
+    await asyncio.sleep(0.5)
+    os.execv(sys.executable, [sys.executable, "-m", "src.main"])
+
+
+async def revert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /revert [N] — reset the bot repo by N commits (default 1, max 5)."""
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    user_id = update.effective_user.id
+
+    args = update.message.text.split()[1:] if update.message.text else []
+    n = 1
+    if args and args[0].isdigit():
+        n = max(1, min(int(args[0]), 5))
+
+    try:
+        log_text = await _git(["log", "--oneline", f"-{n + 1}"])
+        dirty = await _git(["diff", "--stat", "HEAD"])
+        await _git(["reset", "--hard", f"HEAD~{n}"])
+        await _git(["clean", "-fd"])
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Revert failed: {escape_html(str(e))}",
+            parse_mode="HTML",
+        )
+        return
+
+    parts = [f"Reverted <b>{n}</b> commit(s)."]
+    if log_text:
+        parts.append(f"<pre>{escape_html(log_text[:1500])}</pre>")
+    if dirty:
+        parts.append("<b>+ uncommitted changes cleared</b>")
+
+    await update.message.reply_text("\n".join(parts), parse_mode="HTML")
+
+    if audit_logger:
+        await audit_logger.log_command(user_id, "revert", [str(n)], True)
+
+    logger.info("Revert completed", user_id=user_id, commits=n)
+
+
+# Context window size per model (tokens). Default to 200k.
+_CONTEXT_WINDOW = 200_000
+
+
+def _build_context_message(usage: dict, session_turns: int) -> str:  # type: ignore[type-arg]
+    """Format context usage as a readable Telegram message."""
+    input_tokens = usage.get("input_tokens", 0)
+    cache_read = usage.get("cache_read_input_tokens", 0)
+    cache_create = usage.get("cache_creation_input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+
+    # Total context ≈ all tokens Claude currently holds
+    total_used = input_tokens + cache_read + cache_create + output_tokens
+    pct = total_used / _CONTEXT_WINDOW * 100
+
+    bar_filled = int(pct / 10)
+    bar = "▓" * bar_filled + "░" * (10 - bar_filled)
+
+    lines = [
+        "📊 <b>Context Usage</b>",
+        "",
+        f"Context:  <b>{total_used:,}</b> / {_CONTEXT_WINDOW:,} tokens (<b>{pct:.1f}%</b>)",
+        f"          {bar}",
+        "",
+        f"This turn: {input_tokens:,} in / {output_tokens:,} out",
+        f"Cached:    {cache_read:,} tokens",
+        f"Turns:     {session_turns}",
+    ]
+    if pct >= 75:
+        lines += ["", "⚠️ Consider using /compact soon."]
+
+    return "\n".join(lines)
+
+
+async def context_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /context — show current session context window usage."""
+    usage = context.user_data.get("last_usage")
+    if not usage:
+        await update.message.reply_text(
+            "No context data yet. Send a message first.",
+        )
+        return
+
+    session_turns = context.user_data.get("session_turns", 0)
+    text = _build_context_message(usage, session_turns)
+    await update.message.reply_text(text, parse_mode="HTML")
+
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    if audit_logger:
+        await audit_logger.log_command(
+            update.effective_user.id, "context", [], True
+        )
 
 
 def _format_file_size(size: int) -> str:
@@ -1275,3 +1421,99 @@ def _escape_markdown(text: str) -> str:
     Legacy name kept for compatibility with callers; actually escapes HTML.
     """
     return escape_html(text)
+
+
+def _build_cost_message(session_cost: float, total_usage: dict) -> str:  # type: ignore[type-arg]
+    """Format cumulative session cost as a readable Telegram message."""
+    input_tokens = total_usage.get("input_tokens", 0)
+    cache_read = total_usage.get("cache_read_input_tokens", 0)
+    cache_create = total_usage.get("cache_creation_input_tokens", 0)
+    output_tokens = total_usage.get("output_tokens", 0)
+    total_tokens = input_tokens + cache_read + cache_create + output_tokens
+
+    lines = [
+        "💰 <b>Session Cost</b>",
+        "",
+        f"Cost:    <b>${session_cost:.4f}</b>",
+        "",
+        f"Tokens:  {total_tokens:,} total",
+        f"  Input:        {input_tokens:,}",
+        f"  Output:       {output_tokens:,}",
+        f"  Cache read:   {cache_read:,}",
+        f"  Cache write:  {cache_create:,}",
+    ]
+    return "\n".join(lines)
+
+
+async def cost_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /cost — show cumulative session cost and token usage."""
+    session_cost = context.user_data.get("session_cost_usd", 0.0)
+    total_usage = context.user_data.get("session_total_usage", {})
+
+    if not total_usage and session_cost == 0.0:
+        await update.message.reply_text("No usage data yet. Send a message first.")
+        return
+
+    text = _build_cost_message(session_cost, total_usage)
+    await update.message.reply_text(text, parse_mode="HTML")
+
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    if audit_logger:
+        await audit_logger.log_command(
+            update.effective_user.id, "cost", [], True
+        )
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /cancel — interrupt an active Claude command."""
+    claude_integration: ClaudeIntegration = context.bot_data.get("claude_integration")
+    user_id = update.effective_user.id
+
+    if not claude_integration:
+        await update.message.reply_text("❌ Claude integration not available.")
+        return
+
+    interrupted = await claude_integration.interrupt(user_id)
+    if interrupted:
+        await update.message.reply_text("🛑 Cancelled.")
+    else:
+        await update.message.reply_text("No active task to cancel.")
+
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    if audit_logger:
+        await audit_logger.log_command(user_id, "cancel", [], True)
+
+
+async def compact_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /compact — compact current session context via Claude CLI."""
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    claude_integration: ClaudeIntegration = context.bot_data.get("claude_integration")
+    user_id = update.effective_user.id
+
+    session_id = context.user_data.get("claude_session_id")
+    if not session_id:
+        await update.message.reply_text("No active session to compact.")
+        return
+
+    if not claude_integration:
+        await update.message.reply_text("❌ Claude integration not available.")
+        return
+
+    current_dir = context.user_data.get("current_directory", str(Path(_PROJECT_DIR)))
+    msg = await update.message.reply_text("🔄 Compacting context…")
+    try:
+        response = await claude_integration.run_command(
+            prompt="/compact",
+            working_directory=current_dir,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        context.user_data["claude_session_id"] = response.session_id
+        context.user_data["session_message_count"] = 0
+        await msg.edit_text("✅ Context compacted.")
+    except Exception as e:
+        logger.warning("Compact failed", error=str(e), user_id=user_id)
+        await msg.edit_text(f"❌ Compact failed: {escape_html(str(e))}", parse_mode="HTML")
+
+    if audit_logger:
+        await audit_logger.log_command(user_id, "compact", [], True)

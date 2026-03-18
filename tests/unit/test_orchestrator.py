@@ -82,8 +82,8 @@ def deps():
     }
 
 
-def test_agentic_registers_6_commands(agentic_settings, deps):
-    """Agentic mode registers start, new, status, verbose, repo, restart commands."""
+def test_agentic_registers_12_commands(agentic_settings, deps):
+    """Agentic mode registers start, new, status, verbose, repo, restart, pull, revert, compact, context, cost, cancel."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     app = MagicMock()
     app.add_handler = MagicMock()
@@ -100,17 +100,23 @@ def test_agentic_registers_6_commands(agentic_settings, deps):
     ]
     commands = [h[0][0].commands for h in cmd_handlers]
 
-    assert len(cmd_handlers) == 6
+    assert len(cmd_handlers) == 12
     assert frozenset({"start"}) in commands
     assert frozenset({"new"}) in commands
     assert frozenset({"status"}) in commands
     assert frozenset({"verbose"}) in commands
     assert frozenset({"repo"}) in commands
     assert frozenset({"restart"}) in commands
+    assert frozenset({"pull"}) in commands
+    assert frozenset({"revert"}) in commands
+    assert frozenset({"compact"}) in commands
+    assert frozenset({"context"}) in commands
+    assert frozenset({"cost"}) in commands
+    assert frozenset({"cancel"}) in commands
 
 
-def test_classic_registers_14_commands(classic_settings, deps):
-    """Classic mode registers all 14 commands."""
+def test_classic_registers_20_commands(classic_settings, deps):
+    """Classic mode registers all 20 commands."""
     orchestrator = MessageOrchestrator(classic_settings, deps)
     app = MagicMock()
     app.add_handler = MagicMock()
@@ -125,7 +131,7 @@ def test_classic_registers_14_commands(classic_settings, deps):
         if isinstance(call[0][0], CommandHandler)
     ]
 
-    assert len(cmd_handlers) == 14
+    assert len(cmd_handlers) == 20
 
 
 def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
@@ -156,48 +162,55 @@ def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
 
 
 async def test_agentic_bot_commands(agentic_settings, deps):
-    """Agentic mode returns 6 bot commands."""
+    """Agentic mode returns 12 bot commands."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     commands = await orchestrator.get_bot_commands()
 
-    assert len(commands) == 6
+    assert len(commands) == 12
     cmd_names = [c.command for c in commands]
-    assert cmd_names == ["start", "new", "status", "verbose", "repo", "restart"]
+    assert cmd_names == ["start", "new", "status", "verbose", "repo", "restart", "pull", "revert", "compact", "context", "cost", "cancel"]
 
 
 async def test_classic_bot_commands(classic_settings, deps):
-    """Classic mode returns 14 bot commands."""
+    """Classic mode returns 20 bot commands."""
     orchestrator = MessageOrchestrator(classic_settings, deps)
     commands = await orchestrator.get_bot_commands()
 
-    assert len(commands) == 14
+    assert len(commands) == 20
     cmd_names = [c.command for c in commands]
     assert "start" in cmd_names
     assert "help" in cmd_names
     assert "git" in cmd_names
     assert "restart" in cmd_names
+    assert "pull" in cmd_names
+    assert "revert" in cmd_names
+    assert "compact" in cmd_names
+    assert "context" in cmd_names
+    assert "cost" in cmd_names
+    assert "cancel" in cmd_names
 
 
-async def test_restart_command_sends_sigterm(deps):
-    """restart_command sends SIGTERM to the current process."""
+async def test_restart_command_execv(deps):
+    """restart_command re-execs the bot process via os.execv."""
     from unittest.mock import patch
 
     from src.bot.handlers.command import restart_command
 
     update = MagicMock()
     update.effective_user.id = 123
+    update.effective_chat.id = 456
+    update.effective_message.message_thread_id = None
     update.message.reply_text = AsyncMock()
 
     context = MagicMock()
     context.bot_data = {"audit_logger": None}
 
-    with patch("src.bot.handlers.command.os.kill") as mock_kill:
+    with patch("src.bot.handlers.command.os.execv") as mock_execv, \
+         patch("src.bot.handlers.command._save_restart_chat") as mock_save:
         await restart_command(update, context)
 
-    import os
-    import signal
-
-    mock_kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
+    mock_execv.assert_called_once()
+    mock_save.assert_called_once_with(update)
     # Verify confirmation message was sent
     update.message.reply_text.assert_called_once()
     msg = update.message.reply_text.call_args[0][0]
@@ -263,7 +276,7 @@ async def test_agentic_status_compact(agentic_settings, deps):
 
     call_args = update.message.reply_text.call_args
     text = call_args.args[0]
-    assert "Session: none" in text
+    assert "Status:  none" in text
 
 
 async def test_agentic_text_calls_claude(agentic_settings, deps):

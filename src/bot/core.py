@@ -59,6 +59,9 @@ class ClaudeCodeBot:
         builder.read_timeout(30)
         builder.write_timeout(30)
         builder.pool_timeout(30)
+        # Allow concurrent update processing so callback queries (e.g. Stop
+        # button) can be handled while a long-running message handler is active.
+        builder.concurrent_updates(True)
 
         self.app = builder.build()
 

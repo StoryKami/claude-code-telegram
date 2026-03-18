@@ -37,6 +37,7 @@ class ClaudeIntegration:
         session_id: Optional[str] = None,
         on_stream: Optional[Callable[[StreamUpdate], None]] = None,
         force_new: bool = False,
+        hooks: Optional[dict] = None,
     ) -> ClaudeResponse:
         """Run Claude Code command with full integration."""
         logger.info(
@@ -82,9 +83,11 @@ class ClaudeIntegration:
                 response = await self._execute(
                     prompt=prompt,
                     working_directory=working_directory,
+                    user_id=user_id,
                     session_id=claude_session_id,
                     continue_session=should_continue,
                     stream_callback=on_stream,
+                    hooks=hooks,
                 )
             except Exception as resume_error:
                 # If resume failed (e.g., session expired/missing on Claude's side),
@@ -106,6 +109,7 @@ class ClaudeIntegration:
                     response = await self._execute(
                         prompt=prompt,
                         working_directory=working_directory,
+                        user_id=user_id,
                         session_id=None,
                         continue_session=False,
                         stream_callback=on_stream,
@@ -145,21 +149,32 @@ class ClaudeIntegration:
             )
             raise
 
+    async def interrupt(self, user_id: int) -> bool:
+        """Interrupt an active Claude command for the given user.
+
+        Returns True if interrupted, False if no active command.
+        """
+        return await self.sdk_manager.interrupt(user_id)
+
     async def _execute(
         self,
         prompt: str,
         working_directory: Path,
+        user_id: int = 0,
         session_id: Optional[str] = None,
         continue_session: bool = False,
         stream_callback: Optional[Callable] = None,
+        hooks: Optional[dict] = None,
     ) -> ClaudeResponse:
         """Execute command via SDK."""
         return await self.sdk_manager.execute_command(
             prompt=prompt,
             working_directory=working_directory,
+            user_id=user_id,
             session_id=session_id,
             continue_session=continue_session,
             stream_callback=stream_callback,
+            hooks=hooks,
         )
 
     async def _find_resumable_session(

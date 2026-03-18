@@ -308,6 +308,12 @@ class MessageOrchestrator:
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
             ("restart", command.restart_command),
+            ("pull", command.pull_command),
+            ("revert", command.revert_command),
+            ("compact", command.compact_command),
+            ("context", command.context_command),
+            ("cost", command.cost_command),
+            ("cancel", command.cancel_command),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
@@ -344,11 +350,11 @@ class MessageOrchestrator:
             group=10,
         )
 
-        # Only cd: callbacks (for project selection), scoped by pattern
+        # cd: / stop: / stop_all: / choice: / choice_custom: callbacks
         app.add_handler(
             CallbackQueryHandler(
                 self._inject_deps(self._agentic_callback),
-                pattern=r"^cd:",
+                pattern=r"^(cd:|stop:|stop_all:|choice:|choice_custom:)",
             )
         )
 
@@ -373,6 +379,12 @@ class MessageOrchestrator:
             ("actions", command.quick_actions),
             ("git", command.git_command),
             ("restart", command.restart_command),
+            ("pull", command.pull_command),
+            ("revert", command.revert_command),
+            ("compact", command.compact_command),
+            ("context", command.context_command),
+            ("cost", command.cost_command),
+            ("cancel", command.cancel_command),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
@@ -417,6 +429,12 @@ class MessageOrchestrator:
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
                 BotCommand("restart", "Restart the bot"),
+                BotCommand("pull", "Git pull and restart"),
+                BotCommand("revert", "Revert N commits (default 1)"),
+                BotCommand("compact", "Compact current session context"),
+                BotCommand("context", "Show context window usage"),
+                BotCommand("cost", "Show session cost and token usage"),
+                BotCommand("cancel", "Cancel current running task"),
             ]
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
@@ -437,6 +455,12 @@ class MessageOrchestrator:
                 BotCommand("actions", "Show quick actions"),
                 BotCommand("git", "Git repository commands"),
                 BotCommand("restart", "Restart the bot"),
+                BotCommand("pull", "Git pull and restart"),
+                BotCommand("revert", "Revert N commits (default 1)"),
+                BotCommand("compact", "Compact current session context"),
+                BotCommand("context", "Show context window usage"),
+                BotCommand("cost", "Show session cost and token usage"),
+                BotCommand("cancel", "Cancel current running task"),
             ]
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
@@ -505,13 +529,18 @@ class MessageOrchestrator:
         context.user_data["claude_session_id"] = None
         context.user_data["session_started"] = True
         context.user_data["force_new_session"] = True
+        context.user_data["session_turns"] = 0
+        context.user_data["session_cost_usd"] = 0.0
+        context.user_data["session_total_usage"] = {}
 
         await update.message.reply_text("Session reset. What's next?")
 
     async def agentic_status(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Compact one-line status, no buttons."""
+        """Compact session status with optional context usage."""
+        from .handlers.command import _CONTEXT_WINDOW
+
         current_dir = context.user_data.get(
             "current_directory", self.settings.approved_directory
         )
@@ -520,21 +549,38 @@ class MessageOrchestrator:
         session_id = context.user_data.get("claude_session_id")
         session_status = "active" if session_id else "none"
 
+        lines = [
+            "📋 <b>Session Status</b>",
+            "",
+            f"Status:  {session_status}",
+        ]
+        if session_id:
+            lines.append(f"Session: <code>{session_id[:8]}…</code>")
+        lines.append(f"Dir:     <code>{dir_display}</code>")
+
         # Cost info
-        cost_str = ""
         rate_limiter = context.bot_data.get("rate_limiter")
         if rate_limiter:
             try:
                 user_status = rate_limiter.get_user_status(update.effective_user.id)
                 cost_usage = user_status.get("cost_usage", {})
                 current_cost = cost_usage.get("current", 0.0)
-                cost_str = f" · Cost: ${current_cost:.2f}"
+                lines.append(f"Cost:    ${current_cost:.2f}")
             except Exception:
                 pass
 
-        await update.message.reply_text(
-            f"📂 {dir_display} · Session: {session_status}{cost_str}"
-        )
+        usage = context.user_data.get("last_usage")
+        if usage:
+            input_tokens = usage.get("input_tokens", 0)
+            cache_read = usage.get("cache_read_input_tokens", 0)
+            cache_create = usage.get("cache_creation_input_tokens", 0)
+            output_tokens = usage.get("output_tokens", 0)
+            total_used = input_tokens + cache_read + cache_create + output_tokens
+            pct = total_used / _CONTEXT_WINDOW * 100
+            turns = context.user_data.get("session_turns", 0)
+            lines += ["", f"Context: {total_used:,} tokens ({pct:.1f}%) · {turns} turns"]
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Return effective verbose level: per-user override or global default."""
@@ -546,33 +592,34 @@ class MessageOrchestrator:
     async def agentic_verbose(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Set output verbosity: /verbose [0|1|2]."""
+        """Set output verbosity: /verbose [0|1|2|3]."""
         args = update.message.text.split()[1:] if update.message.text else []
         if not args:
             current = self._get_verbose_level(context)
-            labels = {0: "quiet", 1: "normal", 2: "detailed"}
+            labels = {0: "quiet", 1: "normal", 2: "detailed", 3: "full"}
             await update.message.reply_text(
                 f"Verbosity: <b>{current}</b> ({labels.get(current, '?')})\n\n"
-                "Usage: <code>/verbose 0|1|2</code>\n"
+                "Usage: <code>/verbose 0|1|2|3</code>\n"
                 "  0 = quiet (final response only)\n"
                 "  1 = normal (tools + reasoning)\n"
-                "  2 = detailed (tools with inputs + reasoning)",
+                "  2 = detailed (tools with inputs + reasoning)\n"
+                "  3 = full (everything, no truncation)",
                 parse_mode="HTML",
             )
             return
 
         try:
             level = int(args[0])
-            if level not in (0, 1, 2):
+            if level not in (0, 1, 2, 3):
                 raise ValueError
         except ValueError:
             await update.message.reply_text(
-                "Please use: /verbose 0, /verbose 1, or /verbose 2"
+                "Please use: /verbose 0, /verbose 1, /verbose 2, or /verbose 3"
             )
             return
 
         context.user_data["verbose_level"] = level
-        labels = {0: "quiet", 1: "normal", 2: "detailed"}
+        labels = {0: "quiet", 1: "normal", 2: "detailed", 3: "full"}
         await update.message.reply_text(
             f"Verbosity set to <b>{level}</b> ({labels[level]})",
             parse_mode="HTML",
@@ -591,25 +638,30 @@ class MessageOrchestrator:
         elapsed = time.time() - start_time
         lines: List[str] = [f"Working... ({elapsed:.0f}s)\n"]
 
-        for entry in activity_log[-15:]:  # Show last 15 entries max
+        if verbose_level >= 3:
+            # Level 3: show everything, no entry limit
+            entries = activity_log
+        else:
+            entries = activity_log[-15:]
+
+        for entry in entries:
             kind = entry.get("kind", "tool")
             if kind == "text":
-                # Claude's intermediate reasoning/commentary
                 snippet = entry.get("detail", "")
-                if verbose_level >= 2:
+                if verbose_level >= 3:
+                    lines.append(f"\U0001f4ac {snippet}")
+                elif verbose_level >= 2:
                     lines.append(f"\U0001f4ac {snippet}")
                 else:
-                    # Level 1: one short line
                     lines.append(f"\U0001f4ac {snippet[:80]}")
             else:
-                # Tool call
                 icon = _tool_icon(entry["name"])
                 if verbose_level >= 2 and entry.get("detail"):
                     lines.append(f"{icon} {entry['name']}: {entry['detail']}")
                 else:
                     lines.append(f"{icon} {entry['name']}")
 
-        if len(activity_log) > 15:
+        if verbose_level < 3 and len(activity_log) > 15:
             lines.insert(1, f"... ({len(activity_log) - 15} earlier entries)\n")
 
         return "\n".join(lines)
@@ -645,6 +697,30 @@ class MessageOrchestrator:
         return ""
 
     @staticmethod
+    def _full_tool_input(tool_name: str, tool_input: Dict[str, Any]) -> str:
+        """Return full tool input for verbose level 3 (no truncation)."""
+        if not tool_input:
+            return ""
+        if tool_name in ("Read", "Write", "Edit", "MultiEdit"):
+            path = tool_input.get("file_path") or tool_input.get("path", "")
+            return path if path else str(tool_input)
+        if tool_name in ("Glob", "Grep"):
+            pattern = tool_input.get("pattern", "")
+            path = tool_input.get("path", "")
+            parts = [pattern]
+            if path:
+                parts.append(f"in {path}")
+            return " ".join(parts)
+        if tool_name == "Bash":
+            cmd = tool_input.get("command", "")
+            return _redact_secrets(cmd) if cmd else ""
+        if tool_name in ("WebFetch", "WebSearch"):
+            return tool_input.get("url", "") or tool_input.get("query", "")
+        # Generic: show all key=value pairs
+        parts = [f"{k}={v}" for k, v in tool_input.items()]
+        return ", ".join(parts)
+
+    @staticmethod
     def _start_typing_heartbeat(
         chat: Any,
         interval: float = 2.0,
@@ -678,12 +754,18 @@ class MessageOrchestrator:
         mcp_images: Optional[List[ImageAttachment]] = None,
         approved_directory: Optional[Path] = None,
         draft_streamer: Optional[DraftStreamer] = None,
+        progress_markup: Any = None,
+        mcp_choices: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Callable[[StreamUpdate], Any]]:
         """Create a stream callback for verbose progress updates.
 
         When *mcp_images* is provided, the callback also intercepts
         ``send_image_to_user`` tool calls and collects validated
         :class:`ImageAttachment` objects for later Telegram delivery.
+
+        When *mcp_choices* is provided, the callback intercepts
+        ``present_choices`` tool calls and collects choice data
+        for later inline keyboard delivery.
 
         When *draft_streamer* is provided, tool activity and assistant
         text are streamed to the user in real time via
@@ -695,7 +777,14 @@ class MessageOrchestrator:
         """
         need_mcp_intercept = mcp_images is not None and approved_directory is not None
 
-        if verbose_level == 0 and not need_mcp_intercept and draft_streamer is None:
+        need_choice_intercept = mcp_choices is not None
+
+        if (
+            verbose_level == 0
+            and not need_mcp_intercept
+            and not need_choice_intercept
+            and draft_streamer is None
+        ):
             return None
 
         last_edit_time = [0.0]  # mutable container for closure
@@ -719,11 +808,35 @@ class MessageOrchestrator:
                         if img:
                             mcp_images.append(img)
 
+            # Intercept present_choices MCP tool calls
+            if update_obj.tool_calls and need_choice_intercept:
+                for tc in update_obj.tool_calls:
+                    tc_name = tc.get("name", "")
+                    if tc_name == "present_choices" or tc_name.endswith(
+                        "__present_choices"
+                    ):
+                        tc_input = tc.get("input", {})
+                        question = tc_input.get("question", "")
+                        choices = tc_input.get("choices", [])
+                        allow_custom = tc_input.get("allow_custom", False)
+                        if isinstance(choices, list) and 2 <= len(choices) <= 8:
+                            mcp_choices.append({
+                                "question": question,
+                                "choices": [str(c)[:60] for c in choices],
+                                "allow_custom": bool(allow_custom),
+                            })
+
             # Capture tool calls
             if update_obj.tool_calls:
                 for tc in update_obj.tool_calls:
                     name = tc.get("name", "unknown")
-                    detail = self._summarize_tool_input(name, tc.get("input", {}))
+                    tool_input = tc.get("input", {})
+                    # Debug: log ALL tool call names
+                    logger.warning("tool_call", tool_name=name)
+                    if verbose_level >= 3:
+                        detail = self._full_tool_input(name, tool_input)
+                    else:
+                        detail = self._summarize_tool_input(name, tool_input)
                     if verbose_level >= 1:
                         tool_log.append(
                             {"kind": "tool", "name": name, "detail": detail}
@@ -738,10 +851,12 @@ class MessageOrchestrator:
             # Capture assistant text (reasoning / commentary)
             if update_obj.type == "assistant" and update_obj.content:
                 text = update_obj.content.strip()
-                if text:
-                    first_line = text.split("\n", 1)[0].strip()
-                    if first_line:
-                        if verbose_level >= 1:
+                if text and verbose_level >= 1:
+                    if verbose_level >= 3:
+                        tool_log.append({"kind": "text", "detail": text})
+                    else:
+                        first_line = text.split("\n", 1)[0].strip()
+                        if first_line:
                             tool_log.append(
                                 {"kind": "text", "detail": first_line[:120]}
                             )
@@ -765,7 +880,9 @@ class MessageOrchestrator:
                         tool_log, verbose_level, start_time
                     )
                     try:
-                        await progress_msg.edit_text(new_text)
+                        await progress_msg.edit_text(
+                            new_text, reply_markup=progress_markup
+                        )
                     except Exception:
                         pass
 
@@ -881,11 +998,35 @@ class MessageOrchestrator:
                 await update.message.reply_text(f"⏱️ {limit_message}")
                 return
 
+        # Stop All: drop all messages for a grace period after Stop All
+        stop_all_until = context.user_data.get("stop_all_until")
+        if stop_all_until is not None:
+            from datetime import datetime, timezone, timedelta
+            elapsed = (datetime.now(timezone.utc) - stop_all_until).total_seconds()
+            if elapsed < 10:
+                logger.info(
+                    "Dropped message (stop_all active)",
+                    user_id=user_id,
+                    elapsed_seconds=round(elapsed, 1),
+                )
+                return
+            # Grace period expired — clear the flag and proceed normally
+            context.user_data.pop("stop_all_until", None)
+
+        # Clear any pending choice buttons (user typed manually instead)
+        context.user_data.pop("pending_choices", None)
+
         chat = update.message.chat
         await chat.send_action("typing")
 
         verbose_level = self._get_verbose_level(context)
-        progress_msg = await update.message.reply_text("Working...")
+        stop_markup = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🛑 Stop", callback_data=f"stop:{user_id}"),
+                InlineKeyboardButton("⏹ Stop All", callback_data=f"stop_all:{user_id}"),
+            ]
+        ])
+        progress_msg = await update.message.reply_text("Working...", reply_markup=stop_markup)
 
         claude_integration = context.bot_data.get("claude_integration")
         if not claude_integration:
@@ -907,6 +1048,7 @@ class MessageOrchestrator:
         tool_log: List[Dict[str, Any]] = []
         start_time = time.time()
         mcp_images: List[ImageAttachment] = []
+        mcp_choices: List[Dict[str, Any]] = []
 
         # Stream drafts (private chats only)
         draft_streamer: Optional[DraftStreamer] = None
@@ -927,6 +1069,8 @@ class MessageOrchestrator:
             mcp_images=mcp_images,
             approved_directory=self.settings.approved_directory,
             draft_streamer=draft_streamer,
+            progress_markup=stop_markup,
+            mcp_choices=mcp_choices,
         )
 
         # Independent typing heartbeat — stays alive even with no stream events
@@ -934,6 +1078,40 @@ class MessageOrchestrator:
 
         success = True
         try:
+            # Build PreCompact hook for auto-compact notification
+            _compact_chat_id = chat.id
+            _compact_thread_id = update.message.message_thread_id
+            _compact_bot = context.bot
+
+            async def _on_pre_compact(hook_input, tool_use_id, hook_context):
+                if hook_input.get("trigger") == "auto":
+                    try:
+                        await _compact_bot.send_message(
+                            chat_id=_compact_chat_id,
+                            text="🔄 Auto-compacting context…",
+                            message_thread_id=_compact_thread_id,
+                        )
+                    except Exception:
+                        pass
+                return {}
+
+            async def _on_notification(hook_input, tool_use_id, hook_context):
+                logger.info(
+                    "CLI notification",
+                    notification_type=hook_input.get("notification_type"),
+                    title=hook_input.get("title"),
+                    message=hook_input.get("message", "")[:500],
+                    user_id=user_id,
+                    session_id=session_id,
+                )
+                return {}
+
+            from claude_agent_sdk import HookMatcher
+            compact_hooks = {
+                "PreCompact": [HookMatcher(hooks=[_on_pre_compact])],
+                "Notification": [HookMatcher(hooks=[_on_notification])],
+            }
+
             claude_response = await claude_integration.run_command(
                 prompt=message_text,
                 working_directory=current_dir,
@@ -941,6 +1119,7 @@ class MessageOrchestrator:
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
+                hooks=compact_hooks,
             )
 
             # New session created successfully — clear the one-shot flag
@@ -948,6 +1127,25 @@ class MessageOrchestrator:
                 context.user_data["force_new_session"] = False
 
             context.user_data["claude_session_id"] = claude_response.session_id
+
+            if claude_response.usage:
+                context.user_data["last_usage"] = claude_response.usage
+                context.user_data["session_turns"] = (
+                    context.user_data.get("session_turns", 0) + 1
+                )
+                # Accumulate per-session cost and token totals
+                context.user_data["session_cost_usd"] = (
+                    context.user_data.get("session_cost_usd", 0.0)
+                    + (claude_response.cost or 0.0)
+                )
+                prev = context.user_data.get("session_total_usage", {})
+                new_usage = claude_response.usage
+                context.user_data["session_total_usage"] = {
+                    "input_tokens": prev.get("input_tokens", 0) + new_usage.get("input_tokens", 0),
+                    "output_tokens": prev.get("output_tokens", 0) + new_usage.get("output_tokens", 0),
+                    "cache_read_input_tokens": prev.get("cache_read_input_tokens", 0) + new_usage.get("cache_read_input_tokens", 0),
+                    "cache_creation_input_tokens": prev.get("cache_creation_input_tokens", 0) + new_usage.get("cache_creation_input_tokens", 0),
+                }
 
             # Track directory changes
             from .handlers.message import _update_working_directory_from_claude_response
@@ -978,6 +1176,11 @@ class MessageOrchestrator:
                 claude_response.content
             )
 
+        except asyncio.CancelledError:
+            # User pressed Stop — clean up silently, no error message
+            success = False
+            formatted_messages = []
+            logger.info("Claude command cancelled by user", user_id=user_id)
         except Exception as e:
             success = False
             logger.error("Claude integration failed", error=str(e), user_id=user_id)
@@ -995,6 +1198,10 @@ class MessageOrchestrator:
                 except Exception:
                     logger.debug("Draft flush failed in finally block", user_id=user_id)
 
+        try:
+            await progress_msg.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         try:
             await progress_msg.delete()
         except Exception:
@@ -1020,9 +1227,12 @@ class MessageOrchestrator:
                     logger.warning("Image+caption send failed", error=str(img_err))
 
         # Send text messages (skip if caption was already embedded in photos)
+        # If choices are pending, skip the "No content to display" fallback
         if not caption_sent:
             for i, message in enumerate(formatted_messages):
                 if not message.text or not message.text.strip():
+                    continue
+                if mcp_choices and "No content to display" in message.text:
                     continue
                 try:
                     await update.message.reply_text(
@@ -1069,6 +1279,41 @@ class MessageOrchestrator:
                     )
                 except Exception as img_err:
                     logger.warning("Image send failed", error=str(img_err))
+
+        # Send choice buttons if present_choices was called
+        logger.warning("mcp_choices check", count=len(mcp_choices), success=success)
+        if mcp_choices and success:
+            last_choice = mcp_choices[-1]  # use the last one if multiple
+            choice_list = last_choice["choices"]
+            question = last_choice.get("question", "")
+            allow_custom = last_choice.get("allow_custom", False)
+
+            # Build inline keyboard — 1 button per row
+            buttons = []
+            for idx, choice_text in enumerate(choice_list):
+                cb_data = f"choice:{user_id}:{idx}"
+                buttons.append([InlineKeyboardButton(choice_text, callback_data=cb_data)])
+
+            if allow_custom:
+                buttons.append([
+                    InlineKeyboardButton(
+                        "✏️ Type...", callback_data=f"choice_custom:{user_id}"
+                    )
+                ])
+
+            markup = InlineKeyboardMarkup(buttons)
+
+            # Store choices so the callback can look up the full text
+            context.user_data["pending_choices"] = {
+                "choices": choice_list,
+                "question": question,
+            }
+
+            label = question if question else "Choose one:"
+            try:
+                await update.message.reply_text(label, reply_markup=markup)
+            except Exception as e:
+                logger.warning("Failed to send choice buttons", error=str(e))
 
         # Audit log
         audit_logger = context.bot_data.get("audit_logger")
@@ -1558,11 +1803,162 @@ class MessageOrchestrator:
     async def _agentic_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle cd: callbacks — switch directory and resume session if available."""
+        """Handle cd:/stop:/stop_all:/choice: callbacks."""
         query = update.callback_query
+        data = query.data
+
+        # --- Choice button ---
+        if data.startswith("choice:"):
+            try:
+                await query.answer()
+            except Exception:
+                pass
+
+            parts = data.split(":", 2)  # choice:<owner_id>:<index>
+            if len(parts) != 3:
+                return
+            owner_id = int(parts[1])
+            choice_idx = int(parts[2])
+
+            # Only the owner can pick
+            if query.from_user.id != owner_id:
+                try:
+                    await query.answer("This button is not for you.", show_alert=True)
+                except Exception:
+                    pass
+                return
+
+            pending = context.user_data.get("pending_choices")
+            if not pending:
+                try:
+                    await query.edit_message_text("(choices expired)")
+                except Exception:
+                    pass
+                return
+
+            choices = pending.get("choices", [])
+            if choice_idx >= len(choices):
+                return
+
+            chosen = choices[choice_idx]
+            context.user_data.pop("pending_choices", None)
+
+            # Remove buttons, show what was chosen
+            try:
+                await query.edit_message_text(f"→ {chosen}")
+            except Exception:
+                pass
+
+            # Send the choice to Claude as a new message
+            claude_integration = context.bot_data.get("claude_integration")
+            if claude_integration:
+                chat = query.message.chat
+                try:
+                    await chat.send_action("typing")
+                    claude_response = await claude_integration.run_command(
+                        prompt=chosen,
+                        user_id=owner_id,
+                        working_directory=context.user_data.get(
+                            "working_directory",
+                            self.settings.approved_directory,
+                        ),
+                    )
+                    if claude_response and claude_response.content:
+                        from .utils.formatting import ResponseFormatter
+                        formatter = ResponseFormatter(self.settings)
+                        msgs = formatter.format_claude_response(
+                            claude_response.content
+                        )
+                        for msg in msgs:
+                            if msg.text and msg.text.strip():
+                                try:
+                                    await chat.send_message(
+                                        msg.text,
+                                        parse_mode=msg.parse_mode,
+                                    )
+                                except Exception:
+                                    await chat.send_message(msg.text)
+                except Exception as e:
+                    logger.error("Choice response failed", error=str(e))
+                    try:
+                        await chat.send_message(f"Error: {str(e)[:200]}")
+                    except Exception:
+                        pass
+            return
+
+        # --- Choice custom (Type...) ---
+        if data.startswith("choice_custom:"):
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            owner_id = int(data.split(":", 1)[1])
+            if query.from_user.id != owner_id:
+                try:
+                    await query.answer("This button is not for you.", show_alert=True)
+                except Exception:
+                    pass
+                return
+            # Remove buttons, prompt user to type
+            context.user_data.pop("pending_choices", None)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            try:
+                await query.message.reply_text("Type your response:")
+            except Exception:
+                pass
+            return
+
+        # --- Stop / Stop All ---
+        if data.startswith("stop:") or data.startswith("stop_all:"):
+            action, owner_id_str = data.split(":", 1)
+            owner_id = int(owner_id_str)
+
+            # Only the message owner can press Stop
+            if query.from_user.id != owner_id:
+                try:
+                    await query.answer("This button is not for you.", show_alert=True)
+                except Exception:
+                    pass
+                return
+
+            try:
+                await query.answer()
+            except Exception:
+                pass  # "Query is too old" — still proceed with interrupt
+
+            claude_integration = context.bot_data.get("claude_integration")
+            if claude_integration:
+                await claude_integration.interrupt(owner_id)
+
+            if action == "stop_all":
+                from datetime import datetime, timezone
+                context.user_data["stop_all_until"] = datetime.now(timezone.utc)
+
+            # Remove buttons from progress message
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            try:
+                await query.message.reply_text(
+                    "🛑 Stopped." if action == "stop" else "⏹ Stopped. Queued messages dropped."
+                )
+            except Exception:
+                # Progress message was deleted — send directly to chat
+                try:
+                    await context.bot.send_message(
+                        chat_id=query.message.chat_id,
+                        text="🛑 Stopped." if action == "stop" else "⏹ Stopped. Queued messages dropped.",
+                    )
+                except Exception:
+                    pass
+            return
+
         await query.answer()
 
-        data = query.data
         _, project_name = data.split(":", 1)
 
         base = self.settings.approved_directory
