@@ -1446,21 +1446,53 @@ def _build_cost_message(session_cost: float, total_usage: dict) -> str:  # type:
 
 
 async def cost_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /cost — show cumulative session cost and token usage."""
+    """Handle /cost [days] — show session cost + optional daily history."""
+    args = update.message.text.split()[1:] if update.message.text else []
+
+    # Parse optional days argument
+    days = 0
+    if args:
+        try:
+            days = int(args[0])
+            if days < 1 or days > 365:
+                days = 0
+        except ValueError:
+            pass
+
+    # Session cost section
     session_cost = context.user_data.get("session_cost_usd", 0.0)
     total_usage = context.user_data.get("session_total_usage", {})
-
-    if not total_usage and session_cost == 0.0:
-        await update.message.reply_text("No usage data yet. Send a message first.")
-        return
-
     text = _build_cost_message(session_cost, total_usage)
+
+    # Daily history section
+    if days > 0:
+        storage = context.bot_data.get("storage")
+        if storage:
+            user_id = update.effective_user.id
+            daily_costs = await storage.costs.get_user_daily_costs(user_id, days=days)
+            if daily_costs:
+                text += f"\n\n📅 <b>Last {days} days</b>\n"
+                period_total = 0.0
+                period_requests = 0
+                for row in daily_costs:
+                    d = getattr(row, "date", "?")
+                    c = getattr(row, "daily_cost", 0.0) or 0.0
+                    r = getattr(row, "request_count", 0) or 0
+                    text += f"  {d}  ${c:.4f}  ({r} reqs)\n"
+                    period_total += c
+                    period_requests += r
+                text += f"\n  <b>Total: ${period_total:.4f}</b> ({period_requests} reqs)"
+            else:
+                text += f"\n\n📅 No cost data for the last {days} days."
+    elif not total_usage and session_cost == 0.0:
+        text += "\n\n💡 <code>/cost 7</code> — last 7 days history"
+
     await update.message.reply_text(text, parse_mode="HTML")
 
     audit_logger: AuditLogger = context.bot_data.get("audit_logger")
     if audit_logger:
         await audit_logger.log_command(
-            update.effective_user.id, "cost", [], True
+            update.effective_user.id, "cost", args, True
         )
 
 

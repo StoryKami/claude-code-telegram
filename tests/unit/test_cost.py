@@ -79,6 +79,7 @@ async def test_cost_no_usage():
 
     update = MagicMock()
     update.effective_user.id = 123
+    update.message.text = "/cost"
     update.message.reply_text = AsyncMock()
 
     context = MagicMock()
@@ -88,7 +89,9 @@ async def test_cost_no_usage():
     await cost_command(update, context)
 
     update.message.reply_text.assert_called_once()
-    assert "No usage data" in update.message.reply_text.call_args[0][0]
+    text = update.message.reply_text.call_args[0][0]
+    assert "$0.0000" in text
+    assert "/cost 7" in text  # hint for daily history
 
 
 async def test_cost_shows_accumulated_data():
@@ -97,6 +100,7 @@ async def test_cost_shows_accumulated_data():
 
     update = MagicMock()
     update.effective_user.id = 123
+    update.message.text = "/cost"
     update.message.reply_text = AsyncMock()
 
     context = MagicMock()
@@ -128,6 +132,7 @@ async def test_cost_logs_audit():
 
     update = MagicMock()
     update.effective_user.id = 42
+    update.message.text = "/cost"
     update.message.reply_text = AsyncMock()
 
     context = MagicMock()
